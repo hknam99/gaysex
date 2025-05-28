@@ -8,10 +8,11 @@ import time
 from telebot import TeleBot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from collections import deque
-import random
 from datetime import datetime, timedelta
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
 import numpy as np
 
 BOT_ID = "demo" + str(uuid.uuid4())[:8]
@@ -34,6 +35,7 @@ WS_URL = "ws://163.61.110.10:8000/game_sunwin/ws?id=duy914c&key=dduy1514"
 history = deque(maxlen=1000)
 predictions = {}
 subscribed_chats = set()
+active_chats = set()
 admins = set()
 banned_users = set()
 banned_groups = set()
@@ -42,6 +44,7 @@ groups = set()
 keys = {}
 model = None
 label_encoder = LabelEncoder()
+scaler = StandardScaler()
 MIN_DATA_POINTS = 5
 
 def save_json(obj, fname):
@@ -69,14 +72,16 @@ def save_all():
     save_json(banned_groups, BANNED_GROUPS_FILE)
     save_json(users, USERS_FILE)
     save_json(groups, GROUPS_FILE)
+    save_json(active_chats, "active_chats.json")
 
 def load_all():
-    global admins, banned_users, banned_groups, users, groups
+    global admins, banned_users, banned_groups, users, groups, active_chats
     admins = load_json(ADMINS_FILE)
     banned_users = load_json(BANNED_USERS_FILE)
     banned_groups = load_json(BANNED_GROUPS_FILE)
     users = load_json(USERS_FILE)
     groups = load_json(GROUPS_FILE)
+    active_chats = load_json("active_chats.json")
 
 def load_history():
     if os.path.exists(HISTORY_FILE):
@@ -110,24 +115,56 @@ def save_keys():
     with open(KEYS_FILE, 'w') as f:
         json.dump(keys, f, ensure_ascii=False, indent=2)
 
+def calculate_features(data):
+    features = []
+    for i in range(len(data)):
+        session = data[i]
+        dice_sum = session["Tong"]
+        time_diff = (session["timestamp"] - data[i-1]["timestamp"]) if i > 0 else 0
+        streak = 1
+        j = i - 1
+        while j >= 0 and data[j]["Ket_qua"] == session["Ket_qua"]:
+            streak += 1
+            j -= 1
+        tai_count = sum(1 for k in range(max(0, i-10), i+1) if data[k]["Ket_qua"] == "Tài")
+        xiu_count = 10 - tai_count if i >= 10 else i - tai_count
+        feature = [
+            session["Xuc_xac_1"],
+            session["Xuc_xac_2"],
+            session["Xuc_xac_3"],
+            dice_sum,
+            time_diff,
+            streak,
+            tai_count,
+            xiu_count
+        ]
+        features.append(feature)
+    return features
+
 def train_model():
     global model
     if len(history) < MIN_DATA_POINTS:
         return False
     data = list(history)
-    X = [[item["Xuc_xac_1"], item["Xuc_xac_2"], item["Xuc_xac_3"], item["Tong"]] for item in data]
+    X = calculate_features(data)
     y = label_encoder.fit_transform([item["Ket_qua"] for item in data])
-    model = RandomForestClassifier(n_estimators=100, random_state=42)
-    model.fit(X, y)
+    X = scaler.fit_transform(X)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    model = RandomForestClassifier(n_estimators=200, max_depth=10, min_samples_split=5, random_state=42)
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+    print(f"Model accuracy: {accuracy:.2f}")
     return True
 
 def predict_taixiu():
     if len(history) < MIN_DATA_POINTS or model is None:
         return None, 0
-    latest = list(history)[-1]
-    X_new = [[latest["Xuc_xac_1"], latest["Xuc_xac_2"], latest["Xuc_xac_3"], latest["Tong"]]]
-    pred = model.predict(X_new)
-    prob = model.predict_proba(X_new)[0][pred[0]] * 100
+    data = list(history)
+    X = calculate_features(data)
+    X = scaler.transform([X[-1]])
+    pred = model.predict(X)
+    prob = model.predict_proba(X)[0][pred[0]] * 100
     prediction = label_encoder.inverse_transform(pred)[0]
     return prediction, round(prob, 1)
 
@@ -158,8 +195,7 @@ def on_message(ws, message):
         train_model()
 
         for chat_id in subscribed_chats.copy():
-            if chat_id in banned_groups:
-                subscribed_chats.remove(chat_id)
+            if chat_id in banned_groups or chat_id not in active_chats:
                 continue
             if chat_id not in predictions:
                 predictions[chat_id] = []
@@ -175,7 +211,7 @@ def on_message(ws, message):
 
             prediction, win_rate = predict_taixiu()
             if prediction:
-                predictions[chat_id].append({"Phien": data["Phien"], "Prediction": prediction, "Actual": None})
+                predictions[chat_id].append({"Phien": data["Phien"], "Prediction": prediction, "WinRate": win_rate, "Actual": None})
                 try:
                     bot.send_message(
                         chat_id,
@@ -201,6 +237,7 @@ def on_message(ws, message):
 
             current_pred = next((p for p in predictions[chat_id] if p["Phien"] == data["Phien"]), None)
             if current_pred:
+                current_pred["Actual"] = data["Ket_qua"]
                 result = "🏆 Chiến thắng" if current_pred["Prediction"] == data["Ket_qua"] else "😢 Thua"
                 try:
                     bot.edit_message_text(
@@ -228,22 +265,21 @@ def on_message(ws, message):
                     pass
                 continue
             for chat_id, user_info in info["users"].items():
-                if not user_info["predict_enabled"]:
+                if not user_info["predict_enabled"] or int(chat_id) not in active_chats:
                     continue
                 if not check_data_sufficiency(int(chat_id)):
                     continue
                 try:
                     analysis_msg = bot.send_message(
                         int(chat_id),
-                        f"🔒 Tín hiệu riêng (Key: {key})\n🤖 Bot đang phân tích ..."
+                        "🤖 Bot đang phân tích ..."
                     )
                     prediction, win_rate = predict_taixiu()
                     if prediction:
                         predictions[int(chat_id)] = predictions.get(int(chat_id), [])
-                        predictions[int(chat_id)].append({"Phien": data["Phien"], "Prediction": prediction, "Actual": None})
+                        predictions[int(chat_id)].append({"Phien": data["Phien"], "Prediction": prediction, "WinRate": win_rate, "Actual": None})
                         bot.send_message(
                             int(chat_id),
-                            f"🔒 Tín hiệu riêng (Key: {key})\n"
                             f"🎲 Phiên: {data['Phien'] + 1}\n"
                             f"🔔 Dự đoán: {prediction}\n"
                             f"📈 Xác suất: {win_rate}%"
@@ -252,16 +288,16 @@ def on_message(ws, message):
                     bot.edit_message_text(
                         chat_id=int(chat_id),
                         message_id=analysis_msg.message_id,
-                        text=f"🔒 Tín hiệu riêng (Key: {key})\n⏳ Vui lòng chờ kết quả ..."
+                        text="⏳ Vui lòng chờ kết quả ..."
                     )
                     current_pred = next((p for p in predictions[int(chat_id)] if p["Phien"] == data["Phien"]), None)
                     if current_pred:
+                        current_pred["Actual"] = data["Ket_qua"]
                         result = "🏆 Chiến thắng" if current_pred["Prediction"] == data["Ket_qua"] else "😢 Thua"
                         bot.edit_message_text(
                             chat_id=int(chat_id),
                             message_id=analysis_msg.message_id,
                             text=(
-                                f"🔒 Tín hiệu riêng (Key: {key})\n"
                                 f"🎰 Phiên: {data['Phien']}\n"
                                 f"📣 Kết quả\n"
                                 f"🎲 Xúc xắc: {data['Xuc_xac_1']}️⃣ {data['Xuc_xac_2']}️⃣ {data['Xuc_xac_3']}️⃣\n"
@@ -300,7 +336,7 @@ def run_websocket():
 def callback_query(call):
     if call.data.startswith("copy_key:"):
         key = call.data.split(":")[1]
-        bot.answer_callback_query(call.id, f"Key: {key}. Vui lòng chọn và sao chép!", show_alert=True)
+        bot.answer_callback_query(call.id, key, show_alert=True)
     elif call.data.startswith("enable_predict:"):
         key = call.data.split(":")[1]
         if not key or key not in keys:
@@ -340,6 +376,28 @@ def callback_query(call):
             text=call.message.text,
             reply_markup=create_predict_buttons(key, chat_id)
         )
+    elif call.data.startswith("enable_bot:"):
+        chat_id = call.data.split(":")[1]
+        active_chats.add(int(chat_id))
+        save_all()
+        bot.answer_callback_query(call.id, "Đã kích hoạt bot!")
+        bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text=call.message.text,
+            reply_markup=create_bot_buttons(chat_id)
+        )
+    elif call.data.startswith("disable_bot:"):
+        chat_id = call.data.split(":")[1]
+        active_chats.discard(int(chat_id))
+        save_all()
+        bot.answer_callback_query(call.id, "Đã tắt bot!")
+        bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text=call.message.text,
+            reply_markup=create_bot_buttons(chat_id)
+        )
 
 def create_predict_buttons(key, chat_id):
     markup = InlineKeyboardMarkup()
@@ -351,6 +409,20 @@ def create_predict_buttons(key, chat_id):
     disable_button = InlineKeyboardButton(
         "⛔ Tắt dự đoán" if predict_enabled else "🔄 Tắt dự đoán (Đang tắt)",
         callback_data=f"disable_predict:{key}"
+    )
+    markup.add(enable_button, disable_button)
+    return markup
+
+def create_bot_buttons(chat_id):
+    markup = InlineKeyboardMarkup()
+    is_active = int(chat_id) in active_chats
+    enable_button = InlineKeyboardButton(
+        "✅ Kích hoạt bot" if not is_active else "🔄 Kích hoạt bot (Đang bật)",
+        callback_data=f"enable_bot:{chat_id}"
+    )
+    disable_button = InlineKeyboardButton(
+        "⛔ Tắt bot" if is_active else "🔄 Tắt bot (Đang tắt)",
+        callback_data=f"disable_bot:{chat_id}"
     )
     markup.add(enable_button, disable_button)
     return markup
@@ -368,12 +440,16 @@ def start(message):
         users.add(user_id)
     save_all()
     subscribed_chats.add(chat_id)
+    active_chats.add(chat_id)
     if chat_id not in predictions:
         predictions[chat_id] = []
-    bot.send_message(chat_id, 
+    bot.send_message(
+        chat_id, 
         "🤖 Xin chào! Đây là bot dự đoán tài xỉu tự động.\n"
         "Để sử dụng bot, vui lòng liên hệ admin: t.me/hknamip\n"
-        "Để xem các lệnh, hãy dùng /help"
+        "Để xem các lệnh, hãy dùng /help\n"
+        "📌 Sử dụng các nút dưới đây để bật/tắt bot:",
+        reply_markup=create_bot_buttons(chat_id)
     )
 
 @bot.message_handler(commands=['help'])
