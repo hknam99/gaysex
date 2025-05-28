@@ -46,6 +46,7 @@ model = None
 label_encoder = LabelEncoder()
 scaler = StandardScaler()
 MIN_DATA_POINTS = 5
+processed_phien = set()
 
 def save_json(obj, fname):
     with open(fname, "w") as f:
@@ -189,11 +190,19 @@ def on_message(ws, message):
             print(f"Invalid data received: {data}")
             return
 
+        phien = data["Phien"]
+        if phien in processed_phien:
+            print(f"Phien {phien} already processed, skipping...")
+            return
+        processed_phien.add(phien)
+
         data["timestamp"] = time.time()
         history.append(data)
         save_history()
         train_model()
 
+        # Lưu dự đoán cho phiên tiếp theo trước
+        prediction, win_rate = predict_taixiu()
         for chat_id in subscribed_chats.copy():
             if chat_id in banned_groups or chat_id not in active_chats:
                 continue
@@ -209,9 +218,8 @@ def on_message(ws, message):
                 subscribed_chats.remove(chat_id)
                 continue
 
-            prediction, win_rate = predict_taixiu()
             if prediction:
-                predictions[chat_id].append({"Phien": data["Phien"], "Prediction": prediction, "WinRate": win_rate, "Actual": None})
+                predictions[chat_id].append({"Phien": data["Phien"] + 1, "Prediction": prediction, "WinRate": win_rate, "Actual": None})
                 try:
                     bot.send_message(
                         chat_id,
@@ -235,6 +243,7 @@ def on_message(ws, message):
                 print(f"Failed to send waiting message to {chat_id}: {e}")
                 continue
 
+            # Lấy dự đoán của phiên trước (data["Phien"]) để so sánh với kết quả thực tế
             current_pred = next((p for p in predictions[chat_id] if p["Phien"] == data["Phien"]), None)
             if current_pred:
                 current_pred["Actual"] = data["Ket_qua"]
@@ -274,10 +283,9 @@ def on_message(ws, message):
                         int(chat_id),
                         "🤖 Bot đang phân tích ..."
                     )
-                    prediction, win_rate = predict_taixiu()
                     if prediction:
                         predictions[int(chat_id)] = predictions.get(int(chat_id), [])
-                        predictions[int(chat_id)].append({"Phien": data["Phien"], "Prediction": prediction, "WinRate": win_rate, "Actual": None})
+                        predictions[int(chat_id)].append({"Phien": data["Phien"] + 1, "Prediction": prediction, "WinRate": win_rate, "Actual": None})
                         bot.send_message(
                             int(chat_id),
                             f"🎲 Phiên: {data['Phien'] + 1}\n"
@@ -334,70 +342,55 @@ def run_websocket():
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
-    if call.data.startswith("copy_key:"):
-        key = call.data.split(":")[1]
-        bot.answer_callback_query(call.id, key, show_alert=True)
-    elif call.data.startswith("enable_predict:"):
-        key = call.data.split(":")[1]
-        if not key or key not in keys:
-            bot.answer_callback_query(call.id, "Key không hợp lệ hoặc đã hết hạn!")
-            return
-        chat_id = str(call.from_user.id)
-        if chat_id not in keys[key]["users"]:
-            bot.answer_callback_query(call.id, "Bạn không có quyền điều khiển key này!")
-            return
-        keys[key]["users"][chat_id]["predict_enabled"] = True
-        save_keys()
-        bot.answer_callback_query(call.id, "Đã bật dự đoán!")
-        bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text=call.message.text,
-            reply_markup=create_predict_buttons(key, chat_id)
-        )
-        if not check_data_sufficiency(int(chat_id)):
-            return
-        bot.send_message(int(chat_id), "✅ Dự đoán đã được bật và sẽ bắt đầu khi đủ dữ liệu.")
-    elif call.data.startswith("disable_predict:"):
-        key = call.data.split(":")[1]
-        if not key or key not in keys:
-            bot.answer_callback_query(call.id, "Key không hợp lệ hoặc đã hết hạn!")
-            return
-        chat_id = str(call.from_user.id)
-        if chat_id not in keys[key]["users"]:
-            bot.answer_callback_query(call.id, "Bạn không có quyền điều khiển key này!")
-            return
-        keys[key]["users"][chat_id]["predict_enabled"] = False
-        save_keys()
-        bot.answer_callback_query(call.id, "Đã tắt dự đoán!")
-        bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text=call.message.text,
-            reply_markup=create_predict_buttons(key, chat_id)
-        )
-    elif call.data.startswith("enable_bot:"):
-        chat_id = call.data.split(":")[1]
-        active_chats.add(int(chat_id))
-        save_all()
-        bot.answer_callback_query(call.id, "Đã kích hoạt bot!")
-        bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text=call.message.text,
-            reply_markup=create_bot_buttons(chat_id)
-        )
-    elif call.data.startswith("disable_bot:"):
-        chat_id = call.data.split(":")[1]
-        active_chats.discard(int(chat_id))
-        save_all()
-        bot.answer_callback_query(call.id, "Đã tắt bot!")
-        bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text=call.message.text,
-            reply_markup=create_bot_buttons(chat_id)
-        )
+    try:
+        if call.data.startswith("copy_key:"):
+            key = call.data.split(":")[1]
+            if key in keys:
+                bot.answer_callback_query(call.id, key, show_alert=True)
+            else:
+                bot.answer_callback_query(call.id, "Key không tồn tại!", show_alert=True)
+        elif call.data.startswith("enable_predict:"):
+            key = call.data.split(":")[1]
+            if not key or key not in keys:
+                bot.answer_callback_query(call.id, "Key không hợp lệ hoặc đã hết hạn!", show_alert=True)
+                return
+            chat_id = str(call.from_user.id)
+            if chat_id not in keys[key]["users"]:
+                bot.answer_callback_query(call.id, "Bạn không có quyền điều khiển key này!", show_alert=True)
+                return
+            keys[key]["users"][chat_id]["predict_enabled"] = True
+            save_keys()
+            bot.answer_callback_query(call.id, "Đã bật dự đoán!")
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=call.message.text,
+                reply_markup=create_predict_buttons(key, chat_id)
+            )
+            if not check_data_sufficiency(int(chat_id)):
+                return
+            bot.send_message(int(chat_id), "✅ Dự đoán đã được bật và sẽ bắt đầu khi đủ dữ liệu.")
+        elif call.data.startswith("disable_predict:"):
+            key = call.data.split(":")[1]
+            if not key or key not in keys:
+                bot.answer_callback_query(call.id, "Key không hợp lệ hoặc đã hết hạn!", show_alert=True)
+                return
+            chat_id = str(call.from_user.id)
+            if chat_id not in keys[key]["users"]:
+                bot.answer_callback_query(call.id, "Bạn không có quyền điều khiển key này!", show_alert=True)
+                return
+            keys[key]["users"][chat_id]["predict_enabled"] = False
+            save_keys()
+            bot.answer_callback_query(call.id, "Đã tắt dự đoán!")
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=call.message.text,
+                reply_markup=create_predict_buttons(key, chat_id)
+            )
+    except Exception as e:
+        print(f"Error in callback_query: {e}")
+        bot.answer_callback_query(call.id, "Lỗi khi xử lý nút, vui lòng thử lại!", show_alert=True)
 
 def create_predict_buttons(key, chat_id):
     markup = InlineKeyboardMarkup()
@@ -409,20 +402,6 @@ def create_predict_buttons(key, chat_id):
     disable_button = InlineKeyboardButton(
         "⛔ Tắt dự đoán" if predict_enabled else "🔄 Tắt dự đoán (Đang tắt)",
         callback_data=f"disable_predict:{key}"
-    )
-    markup.add(enable_button, disable_button)
-    return markup
-
-def create_bot_buttons(chat_id):
-    markup = InlineKeyboardMarkup()
-    is_active = int(chat_id) in active_chats
-    enable_button = InlineKeyboardButton(
-        "✅ Kích hoạt bot" if not is_active else "🔄 Kích hoạt bot (Đang bật)",
-        callback_data=f"enable_bot:{chat_id}"
-    )
-    disable_button = InlineKeyboardButton(
-        "⛔ Tắt bot" if is_active else "🔄 Tắt bot (Đang tắt)",
-        callback_data=f"disable_bot:{chat_id}"
     )
     markup.add(enable_button, disable_button)
     return markup
@@ -448,9 +427,36 @@ def start(message):
         "🤖 Xin chào! Đây là bot dự đoán tài xỉu tự động.\n"
         "Để sử dụng bot, vui lòng liên hệ admin: t.me/hknamip\n"
         "Để xem các lệnh, hãy dùng /help\n"
-        "📌 Sử dụng các nút dưới đây để bật/tắt bot:",
-        reply_markup=create_bot_buttons(chat_id)
+        "📌 Dùng /startbot để chạy bot và /stopbot để tắt bot."
     )
+
+@bot.message_handler(commands=['startbot'])
+def startbot_cmd(message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    if chat_id in banned_groups or user_id in banned_users:
+        bot.reply_to(message, "Bot không hoạt động trong nhóm/người dùng này.")
+        return
+    if chat_id not in subscribed_chats:
+        bot.reply_to(message, "Vui lòng dùng /start trước!")
+        return
+    active_chats.add(chat_id)
+    save_all()
+    bot.reply_to(message, "✅ Bot đã được kích hoạt!")
+
+@bot.message_handler(commands=['stopbot'])
+def stopbot_cmd(message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    if chat_id in banned_groups or user_id in banned_users:
+        bot.reply_to(message, "Bot không hoạt động trong nhóm/người dùng này.")
+        return
+    if chat_id not in subscribed_chats:
+        bot.reply_to(message, "Vui lòng dùng /start trước!")
+        return
+    active_chats.discard(chat_id)
+    save_all()
+    bot.reply_to(message, "⛔ Bot đã được tắt!")
 
 @bot.message_handler(commands=['help'])
 def help_cmd(message):
@@ -477,6 +483,8 @@ def help_cmd(message):
             "/tbrieng - Reply vào user & nhập nội dung (admin)\n"
             "/xoatb - Reply vào thông báo cần xoá (admin)\n"
             "/xoakey <key> - Xoá key khỏi hệ thống (admin)\n"
+            "/startbot - Chạy bot\n"
+            "/stopbot - Tắt bot\n"
         )
     else:
         bot.reply_to(message,
@@ -485,6 +493,8 @@ def help_cmd(message):
             "/help - Xem hướng dẫn\n"
             "/key <key> - Nhập key để nhận tín hiệu riêng\n"
             "/lichsu <số_ván> - Xem lịch sử X ván gần nhất\n"
+            "/startbot - Chạy bot\n"
+            "/stopbot - Tắt bot\n"
         )
 
 @bot.message_handler(commands=['lichsu'])
